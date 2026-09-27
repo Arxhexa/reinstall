@@ -11,7 +11,7 @@ confhome_cn=https://cnb.cool/bin456789/reinstall/-/git/raw/main
 # confhome_cn=https://www.ghproxy.cc/https://raw.githubusercontent.com/bin456789/reinstall/main
 
 # 用于判断 reinstall.sh 和 trans.sh 是否兼容
-SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0004
+SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0005
 
 # 记录要用到的 windows 程序，运行时输出删除 \r
 WINDOWS_EXES='cmd powershell wmic reg diskpart netsh bcdedit mountvol'
@@ -368,6 +368,10 @@ insert_into_file() {
 
     case "$location" in
     before) line_num=$((line_num - 1)) ;;
+    replace)
+        sed -i "${line_num}d" "$file"
+        line_num=$((line_num - 1))
+        ;;
     after) ;;
     *) return 1 ;;
     esac
@@ -940,6 +944,26 @@ is_have_arm64_version() {
     return 1
 }
 
+is_have_32_bit_version() {
+    case "$version" in
+    2008)
+        return
+        ;;
+    vista | 7 | 8 | 8.1)
+        return
+        ;;
+    10)
+        # iot enterprise 曾经有 32 位版本
+        # en_windows_10_iot_enterprise_version_1909_x86_dvd_b62f9c12.iso
+        case "$edition" in
+        'iot enterprise ltsc 2021') return 1 ;;
+        *) return ;;
+        esac
+        ;;
+    esac
+    return 1
+}
+
 find_windows_iso() {
     parse_windows_image_name || error_and_exit "--image-name wrong: $image_name"
     if ! { [ "$version" = 8 ] || [ "$version" = 8.1 ]; } && [ -z "$edition" ]; then
@@ -959,8 +983,14 @@ find_windows_iso() {
     full_langs="$(lang_convert full_language) $(lang_convert fallback_full_language)"
     full_langs=$(xargs -n 1 <<<"$full_langs" | awk '!seen[$0]++' | xargs)
 
-    case "$basearch" in
-    x86) # 备用，查找功能目前不支持 32 位
+    # 默认 64 位，除非指定了 32 位
+    iso_arch_to_find=$basearch
+    if [ "$bit" = 32 ]; then
+        iso_arch_to_find=x86
+    fi
+
+    case "$iso_arch_to_find" in
+    x86)
         arch_win=x86
         arch_win_vlsc='32-?bit'
         ;;
@@ -1189,6 +1219,7 @@ get_windows_iso_link() {
     echo "Label vlsc: $label_vlsc"
     echo "Page:       $page_url"
     echo "Languages:  $langs $full_langs"
+    echo "Arch:       $arch_win"
     echo
 
     # 先判断是否能自动查找该版本
@@ -1200,8 +1231,12 @@ get_windows_iso_link() {
         error_and_exit "Not support find this iso. Check if --image-name is wrong. Or set --iso manually."
     fi
 
-    if [ "$basearch" = aarch64 ] && ! is_have_arm64_version; then
+    if [ "$arch_win" = arm64 ] && ! is_have_arm64_version; then
         error_and_exit "No ARM64 iso for this Windows Version or Edition."
+    fi
+
+    if [ "$arch_win" = x86 ] && ! is_have_32_bit_version; then
+        error_and_exit "No 32-bit iso for this Windows Version or Edition."
     fi
 
     if [ -n "$label_msdl" ]; then
@@ -1661,7 +1696,9 @@ Continue?
         if is_in_china; then
             mirror=https://mirror.nju.edu.cn/nix-channels
         else
-            mirror=https://nixos.org/channels
+            # https://nixos.org/channels 没有 ipv6
+            # 且跳转到 https://channels.nixos.org
+            mirror=https://channels.nixos.org
         fi
 
         if is_use_cloud_image; then
@@ -1771,7 +1808,7 @@ Continue?
                     info "get direct link"
                     local iso_name=${iso##*\?}
                     local direct_link
-                    if direct_link=$(curl -L "https://delivery-api.ntriver.org/generate-link?filename=$iso_name" |
+                    if direct_link=$(curl -L "https://ntriver.org/api/drive/generate-link?filename=$iso_name" |
                         grep -oE '"url":"[^"]+"' | cut -d: -f2- | tr -d '"' | grep .); then
                         echo "Direct link: $direct_link" >&2
                         iso="$direct_link"
@@ -3585,6 +3622,7 @@ build_nextos_cmdline() {
     if [ $nextos_distro = alpine ]; then
         nextos_cmdline="alpine_repo=$nextos_repo modloop=$nextos_modloop"
     elif is_distro_like_debian $nextos_distro; then
+        # 我们直接强制 di 优先显示到 串口，因此不需要设置分辨率
         # 设置分辨率为800*600，防止分辨率过高 ssh screen attach 后无法全部显示
         # iso 默认有 vga=788
         # 如果要设置位数: video=800x600-16
@@ -3610,12 +3648,10 @@ build_nextos_cmdline() {
 
     if is_distro_like_debian $nextos_distro; then
         if [ "$basearch" = "x86_64" ]; then
-            # debian installer 好像第一个 tty 是主 tty
-            # 设置ttyS0,tty0,安装界面还是显示在ttyS0
             :
         else
             # debian arm 在没有ttyAMA0的机器上（aws t4g），最少要设置一个tty才能启动
-            # 只设置tty0也行，但安装过程ttyS0没有显示
+            # 只设置tty0也行
             nextos_cmdline+=" $(echo_tmp_ttys)"
         fi
     else
@@ -3660,6 +3696,11 @@ mkdir_clear() {
 }
 
 mod_inittab_for_screen() {
+    # 如果串口不可写
+    # true >/dev/ttyS0 正常
+    # echo >/dev/ttyS0 报 IO 错误
+
+    # /etc/inittab
     # 主 tty 条目由 /usr/sbin/reopen-console 写入
     # ttyAMA0::respawn:/sbin/debian-installer
 
@@ -3676,8 +3717,31 @@ mod_inittab_for_screen() {
         # debian 9-11 没有 stty
         if ! grep -q "^$tty:" /etc/inittab &&
             [ -c "/dev/$tty" ] &&
-            { stty -g -F "/dev/$tty" >/dev/null || : >"/dev/$tty"; } 2>/dev/null; then
+            { stty -g -F "/dev/$tty" >/dev/null || echo >"/dev/$tty"; } 2>/dev/null; then
             echo "$tty::respawn:screen -x root/ -p 1" >>/etc/inittab
+        fi
+    done
+}
+
+# 通过优先使用串口，强制 di 使用小分辨率
+# 防止 tty0 分辨率过大，内容同步到 ttyS0/ttyAMA0 后显示异常/乱码
+force_serial_if_exists() {
+    # 低版本环境没有 awk，改用 cut
+
+    # 优先使用有 C 标识的 tty
+    c_tty=$(cat /proc/consoles | grep -F '(EC' | cut -d' ' -f1)
+    if ! { [ "$c_tty" = ttyAMA0 ] || [ "$c_tty" = ttyS0 ]; }; then
+        # 如果不是串口，则忽略
+        c_tty=
+    fi
+
+    for tty in $c_tty ttyAMA0 ttyS0; do
+        # shellcheck disable=SC2034
+        if [ -c "/dev/$tty" ] &&
+            { stty -g -F "/dev/$tty" >/dev/null || echo >"/dev/$tty"; } 2>/dev/null; then
+            consoles=$tty
+            preferred=$tty
+            break
         fi
     done
 }
@@ -3696,8 +3760,25 @@ mod_initrd_debian_kali() {
     }
     # debian 9 不在 reopen-console 处理 inittab
     # 暂时不管
+    # shellcheck disable=SC2016
     if ! { [ "$distro" = debian ] && [ "$releasever" -le 9 ]; }; then
         get_function_content mod_inittab_for_screen | insert_into_file sbin/reopen-console before 'kill -HUP 1' -F
+
+        # 如果主 tty 是 tty0，S40term-linux 会开启 utf-8，通过 screen 显示在甲骨文云控制台时会出现乱码
+        # 如果主 tty 是 ttyS0 ，S40term-linux 不会开启 utf-8
+        # https://salsa.debian.org/installer-team/rootskel/-/blob/master/src/usr/lib/debian-installer.d/S40term-linux?ref_type=heads
+
+        # 可用以下方法强制 di 显示在 ttyS0，但 /proc/consoles 还是 tty0，S40term-linux 还是会打开 utf-8
+        # 因此还要设置 S40term-linux 或者通过 cmdline 强制 console=ttyS0
+        get_function_content force_serial_if_exists | insert_into_file sbin/reopen-console before 'if [ $PRESEEDING = 1 ]; then' -F
+
+        # 在甲骨文 arm 上设置 console=tty0 console=ttyAMA0 console=ttyS0
+        # 预期 ttyS0 不存在，会把倒数第二个 tty设为主 tty，但实际上主 tty 是 tty0
+        # cat /proc/consoles 可查看哪个是主 tty，有 C 标识的就是主 tty
+
+        # 因此在这里强制 S40term-linux 不使用 utf-8
+        # shellcheck disable=SC1003
+        echo 'if false && : \' | insert_into_file lib/debian-installer.d/S40term-linux before 'if [ -d /usr/lib/locale/C.UTF-8 ]; then' -F
     fi
 
     # hack 3
@@ -4141,9 +4222,18 @@ exit_if_cant_use_cloud_kernel() {
 can_use_cloud_kernel() {
     # initrd 下也要使用，不要用 <<<
 
-    # 有些虚拟机用了 ahci，但云内核没有 ahci 驱动
-    cloud_eth_modules='ena|gve|mana|virtio_net|xen_netfront|hv_netvsc|vmxnet3|mlx4_en|mlx4_core|mlx5_core|ixgbevf'
-    cloud_blk_modules='ata_generic|ata_piix|pata_legacy|nvme|virtio_blk|virtio_scsi|xen_blkfront|xen_scsifront|hv_storvsc|vmw_pvscsi'
+    if [ "$distro" = opensuse ]; then
+        # kernel-default-base 缺少 ena gve mlx mana 驱动
+        cloud_eth_modules='virtio_net|xen_netfront|hv_netvsc|vmxnet3|e100|e1000|e1000e|8139cp|8139too'
+        cloud_blk_modules='ata_generic|ata_piix|ahci|nvme|virtio_blk|virtio_scsi|xen_blkfront|xen_scsifront|hv_storvsc|vmw_pvscsi'
+    else
+        # debian kali
+        cloud_eth_modules='ena|gve|mana|virtio_net|xen_netfront|hv_netvsc|vmxnet3|mlx4_en|mlx4_core|mlx5_core|ixgbevf'
+        cloud_blk_modules='ata_generic|ata_piix|pata_legacy|nvme|virtio_blk|virtio_scsi|xen_blkfront|xen_scsifront|hv_storvsc|vmw_pvscsi'
+        if { [ "$distro" = debian ] && [ "$releasever" -ge 13 ]; } || [ "$distro" = kali ]; then
+            cloud_blk_modules="$cloud_blk_modules|ahci"
+        fi
+    fi
 
     # disk
     drivers="$(get_disk_drivers $1)"
@@ -4175,6 +4265,8 @@ create_can_use_cloud_kernel_sh() {
         $(get_function get_disk_drivers)
         $(get_function can_use_cloud_kernel)
 
+        distro="$distro"
+        releasever="$releasever"
         can_use_cloud_kernel "\$@"
 EOF
 }
@@ -4289,11 +4381,21 @@ EOF
 EOF
 
     # 判断云镜像 debain 能否用云内核
-    if is_distro_like_debian; then
+    if is_distro_like_debian || [ "$distro" = opensuse ]; then
         create_can_use_cloud_kernel_sh can_use_cloud_kernel.sh
         insert_into_file init before '^exec (/bin/busybox )?switch_root' <<EOF
         cp /can_use_cloud_kernel.sh \$sysroot/
         chmod a+x \$sysroot/can_use_cloud_kernel.sh
+EOF
+    fi
+
+    # 临时修复 liveos getty 运行在 tty0
+    # shellcheck disable=SC2016
+    if [ "$nextos_releasever" = 3.24 ] &&
+        txt_to_grep='done < "$ROOT"/sys/class/tty/"$1"/active' &&
+        grep -qF "$txt_to_grep" init; then
+        insert_into_file init replace "$txt_to_grep" -F <<EOF
+done < <(cat "\$ROOT"/sys/class/tty/"\$1"/active | xargs -n 1)
 EOF
     fi
 }
@@ -4804,6 +4906,7 @@ for o in ci installer debug minimal no-cloud-kernel no-auto-drivers allow-ping f
     hold: sleep: \
     iso: \
     image-name: \
+    bit: \
     boot-wim: \
     img: \
     cloud-data: \
@@ -5124,6 +5227,13 @@ EOF
             error_and_exit "Invalid $1 value: $2"
         fi
         lang=$(echo "$2" | to_lower)
+        shift 2
+        ;;
+    --bit)
+        if ! { [ "$2" = 32 ] || [ "$2" = 64 ]; }; then
+            error_and_exit "Invalid $1 value: $2"
+        fi
+        bit=$2
         shift 2
         ;;
     --)
